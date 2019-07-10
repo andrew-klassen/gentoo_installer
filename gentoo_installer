@@ -1,0 +1,134 @@
+#!/bin/bash
+
+# make sure user is root
+if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root." 
+        exit 1
+fi
+
+disk="/dev/sda"
+hostname="gentoo-test"
+
+sgdisk --new=1:0:+100M ${disk}
+sgdisk --new=2:+100M ${disk}
+
+sgdisk --typecode=1:0xEF00 ${disk}
+sgdisk --typecode=2:0x8E00 ${disk}
+
+sgdisk --change-name=1:esp ${disk}
+sgdisk --change-name=2:root ${disk}
+
+mkfs.fat -F 32 ${disk}1
+
+/etc/init.d/lvm start
+
+pvcreate ${disk}2
+vgcreate root-vg ${disk}2
+lvcreate -n root-lv -l +100%FREE root-vg
+
+mkfs.ext4 /dev/root-vg/root-lv
+
+
+mount /dev/root-vg/root-lv /mnt/gentoo
+mkdir -p /mnt/gentoo/efi
+mount ${disk}1 /mnt/gentoo/efi
+
+
+
+stage3_base="https://gentoo.osuosl.org/releases/amd64/autobuilds/current-stage3-amd64/"
+
+wget -q -O tmp.html ${stage3_base}
+stage3_name=$(sed '/</ {:k s/<[^>]*>//g; /</ {N; bk}}' tmp.html | grep "^stage3-amd64-[0-9]" | grep -v "CONTENTS" | grep -v "DIGESTS" | cut -c1-36)
+wget -O stage3-amd64.tar.xz ${stage3_base}/${stage3_name}
+tar xf stage3-amd64.tar.xz --directory /mnt/gentoo
+rm -f tmp.html
+
+
+portage_base="https://gentoo.osuosl.org/snapshots/"
+
+wget -q -O tmp.html ${portage_base}
+portage_name=$(sed '/</ {:k s/<[^>]*>//g; /</ {N; bk}}' tmp.html | grep "^portage-latest.tar.xz" | grep -v "gpgsig" | grep -v "md5sum" | cut -c1-21)
+wget -O portage-latest.tar.xz ${portage_base}/${portage_name}
+tar xf portage-latest.tar.xz --directory /mnt/gentoo/usr
+rm -f tmp.html
+
+cp -L /etc/resolv.conf /mnt/gentoo/etc/resolv.conf
+
+cd /
+mount --types proc /proc /mnt/gentoo/proc
+mount --rbind /sys /mnt/gentoo/sys
+mount --make-rslave /mnt/gentoo/sys
+mount --rbind /dev /mnt/gentoo/dev
+mount --make-rslave /mnt/gentoo/dev 
+
+
+/bin/cp /mnt/gentoo/usr/share/zoneinfo/America/Los_Angeles /mnt/gentoo/etc/localtime
+
+echo "127.0.0.1 ${hostname} localhost" > /mnt/gentoo/etc/hosts
+echo "hostname=\"${hostname}\"" > /mnt/gentoo/etc/conf.d/hostname
+
+sed -i '/^COMMON_FLAGS=/c\COMMON_FLAGS="-march=native -O2 -pipe"' /mnt/gentoo/etc/portage/make.conf
+
+cpu_core_count=$(grep -c ^processor /proc/cpuinfo)
+
+echo "MAKEOPTS=\"-j${cpu_core_count}\"" >> /mnt/gentoo/etc/portage/make.conf
+echo "EMERGE_DEFAULT_OPTS=\"--jobs ${cpu_core_count}\"" >> /mnt/gentoo/etc/portage/make.conf
+
+
+echo "USE=\"-kde -qt5 -X -alsa -pulseaudio -opengl -gnome -gtk -ios -iphone -ipv6 -selinux unicode\"" >> /mnt/gentoo/etc/portage/make.conf
+echo "GRUB_PLATFORMS=\"efi-64\"" >> /mnt/gentoo/etc/portage/make.conf
+echo "LINGUAS=\"en en_US\"" >> /mnt/gentoo/etc/portage/make.conf
+
+echo "en_US ISO-8859-1" >> /mnt/gentoo/locale.gen 
+echo "en_US.UTF-8 UTF-8" >> /mnt/gentoo/locale.gen
+
+chroot /mnt/gentoo locale-gen
+
+
+chroot /mnt/gentoo emerge --sync
+chroot /mnt/gentoo emerge gentoo-sources
+echo "=sys-kernel/linux-firmware-20190620 linux-fw-redistributable no-source-code" >> /mnt/gentoo/etc/portage/package.license
+echo ">=sys-apps/util-linux-2.33.2 static-libs" >> /mnt/gentoo/etc/portage/package.use/zz-autounmask
+chroot /mnt/gentoo emerge sys-kernel/genkernel
+chroot /mnt/gentoo genkernel --lvm --install all
+
+chroot /mnt/gentoo emerge syslog-ng vixie-cron sudo vim sys-boot/grub dhcpcd
+chroot /mnt/gentoo emerge USE="device-mapper" sys-boot/grub
+
+chroot /mnt/gentoo emerge -uDU --keep-going --with-bdeps=y @world
+#chroot /mnt/gentoo emerge -av --depclean
+
+chroot /mnt/gentoo rc-update add syslog-ng default
+chroot /mnt/gentoo rc-update add vixie-cron default
+chroot /mnt/gentoo rc-update add sshd default
+chroot /mnt/gentoo rc-update add lvm boot
+
+chroot /mnt/gentoo useradd andrew
+chroot /mnt/gentoo usermod -a -G wheel andrew
+chroot /mnt/gentoo usermod -p '' andrew
+
+chmod 0700 /mnt/gentoo/etc/sudoers
+echo "%wheel ALL=(ALL) ALL" >> /mnt/gentoo/etc/sudoers
+chmod 0440 /mnt/gentoo/etc/sudoers
+
+root_uuid=$(blkid | grep "/dev/mapper/root--vg-root--lv" | cut -f2 -d'"')
+
+echo "UUID=${root_uuid} / ext4 noatime 0 1" >> /mnt/gentoo/etc/fstab
+
+#grub
+echo "GRUB_CMDLINE_LINUX_DEFAULT=\"dolvm rootfstype=ext4\"" >> /mnt/gentoo/etc/default/grub
+chroot /mnt/gentoo grub-install --target=x86_64-efi --efi-directory=/efi ${disk}2
+chroot /mnt/gentoo grub-mkconfig -o /boot/grub/grub.cfg
+
+mkdir -p /mnt/gentoo/efi/EFI/BOOT
+/bin/cp /mnt/gentoo/efi/EFI/gentoo/grubx64.efi /mnt/gentoo/efi/EFI/BOOT/BOOTX64.EFI
+
+
+reboot
+
+
+
+
+
+
+
